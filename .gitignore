@@ -4,6 +4,8 @@
 .RData
 .Ruserdata
 data/
+.DS_Store
+houston-extreme-winter-weather_files/
 
 # History files
 .Rhistory

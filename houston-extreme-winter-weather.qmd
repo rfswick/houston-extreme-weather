@@ -1,0 +1,334 @@
+---
+title: "EDS 223 Homework Assignment 3"
+author: "Rachel Swick"
+date: last-modified
+execute:
+  warning: false
+  message: false
+format:
+  html:
+    toc: true
+    code-fold: true
+---
+
+# Identifying the Impacts of Extreme Weather
+
+### Learning Goals
+In this assignment we will practice the following:
+- load vector/raster data
+- simple raster operations
+- simple vector operations
+- spatial joins
+
+## 1. Load Packages and Import Data
+```{r}
+# Load packages
+library(terra)
+library(stars)
+library(tidyverse)
+library(tmap)
+library(kableExtra) 
+library(sf)
+library(here)
+library(testthat)
+library(devtools)
+library(remotes)
+library(patchwork)
+```
+
+```{r}
+# Load data
+# 2021-02-07 night lights
+night_lights_07_h08v05 <- rast("data/VNP46A1/VNP46A1.A2021038.h08v05.001.2021039064328.tif")
+night_lights_07_h08v06 <- rast("data/VNP46A1/VNP46A1.A2021038.h08v06.001.2021039064329.tif")
+
+# 2021-02-16 night lights
+night_lights_16_h08v05 <- rast("data/VNP46A1/VNP46A1.A2021047.h08v05.001.2021048091106.tif")
+night_lights_16_h08v06 <- rast("data/VNP46A1/VNP46A1.A2021047.h08v06.001.2021048091105.tif")
+
+# Roads intersecting the Houston Metro Area
+roads <- read_sf(here("data", "gis_osm_roads_free_1.gpkg"), 
+                 query = "SELECT * FROM gis_osm_roads_free_1 WHERE fclass='motorway'")
+
+# Houses in the Houston Metro Area
+houses <- read_sf(here("data", "gis_osm_buildings_a_free_1.gpkg"),
+                  query = "SELECT *
+                          FROM gis_osm_buildings_a_free_1
+                          WHERE (type IS NULL AND name IS NULL)
+                          OR type in ('residential', 
+                                      'apartments', 
+                                      'house', 
+                                      'static_caravan', 
+                                      'detached')")
+
+# Socioeconomic data
+# Geometry layer
+socio_geometry <- read_sf(here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb"), layer = "ACS_2019_5YR_TRACT_48_TEXAS")
+# Income layer
+income <- read_sf(here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb"), layer = "X19_INCOME")
+# Combine the geometry and income layers
+income_geo <- left_join(socio_geometry, income, join_by(GEOID_Data == GEOID))
+```
+
+
+### 2. Ensure Matching Coordinate Reference Systems (CRS)
+
+An accurate map can not be created without first ensuring all spatial objects are using the same CRS.
+
+```{r}
+# Create list of all spatial objects
+spatial_objects <- list(night_lights_07_h08v05, 
+                        night_lights_07_h08v06, 
+                        night_lights_16_h08v05, 
+                        night_lights_16_h08v06,
+                        roads, 
+                        houses, 
+                        income_geo)
+
+# Check if all spatial objects have the same CRS
+# If not, determine whether it is a vector or raster object
+# Update CRS based on object type
+for (i in 2:length(spatial_objects)) {
+  if (inherits(spatial_objects[[i]], "SpatRaster") && 
+      !identical(crs(spatial_objects[[i]]), spatial_objects[[1]])) {
+    spatial_objects[[i]] <- project(spatial_objects[[i]], crs(spatial_objects[[1]]))
+    warning("The CRS has been transformed to match.")
+  }
+  else if (inherits(spatial_objects[[i]], c("sf", "tbl_df", "tbl", "data.frame")) &&
+      st_crs(spatial_objects[[i]]) != st_crs(spatial_objects[[1]])) {
+    spatial_objects[[i]] <- st_transform(spatial_objects[[i]], st_crs(spatial_objects[[1]]))
+    warning("The CRS has been transformed to match.")
+  }
+  else {
+    print("The CRS Match.")
+  }
+}
+
+# Check that all spatial objects have been transformed
+for (i in 2:length(spatial_objects)) {
+  print(st_crs(spatial_objects[[i]]) == st_crs(spatial_objects[[1]]))
+}
+```
+
+### 3. Create the Blackout Mask
+
+In order to see which areas experienced blackout, we need to determine where there was a change in night light intensity pre and post storm. 
+
+```{r}
+# Combine the night light data for each date into one raster object
+night_lights_07 <- merge(night_lights_07_h08v05, night_lights_07_h08v06)
+night_lights_16 <- merge(night_lights_16_h08v05, night_lights_16_h08v06)
+
+# Find the difference in night light intensity caused by the storm
+night_light_diff <- night_lights_07 - night_lights_16
+```
+
+```{r}
+# Assign NA to all locations that experienced a drop of less than 200 nW cm-2sr-1 change
+night_light_diff[night_light_diff < 200 ] <- NA
+
+# Vectorize the blackout mask
+night_light_diff_vector <- as.polygons(night_light_diff) %>% 
+  st_as_sf() %>% 
+  st_make_valid()
+```
+
+```{r}
+# Crop the blackout mask to the Houston area
+# Create a bbox for the Houston area
+houston <- st_bbox(c(xmin = -96.5,
+                          ymin = 29,
+                          xmax = -94.5,
+                          ymax = 30.5)) %>% 
+  st_as_sfc() %>% 
+  st_set_crs(crs(night_light_diff_vector))
+
+# Join the Houston bbox to the night light object
+houston_night_lights_diff <- st_intersection(night_light_diff_vector, houston)
+```
+
+```{r}
+# Change the crs of the Houston night light data set to EPSG:3083
+houston_night_lights_diff <- st_transform(houston_night_lights_diff, crs = 3083)
+```
+
+### Map of the Houston Area Before the Storm
+```{r}
+# Light map before the storm
+tm_shape(night_lights_07,
+         bbox = houston) +
+  tm_raster(palette = c("black", "#F2DD6E"), 
+            breaks = c(0, 100, 200, 300, 500, 1000, 2000, 4000, 6000, 8000, Inf), 
+            title = "Radiance (nW cm⁻² sr⁻¹)",
+            legend.show = TRUE) +
+  tm_layout(main.title = "Houston Metro Area Prior to 2017 Winter Storm",  
+            main.title.size = 1.5,  
+            main.title.position = c("center", "top"),  
+            legend.outside = TRUE,  
+            legend.outside.position = "right",
+            attr.outside = TRUE) +
+  tm_compass(position = c("RIGHT", "top")) +
+  tm_scale_bar(position = c("LEFT", "top"))
+```
+
+### Map of the Houston Area After the Storm
+```{r}
+# Light map after the storm
+tm_shape(night_lights_16,
+         bbox = houston) +
+  tm_raster(palette = c("black", "#F2DD6E"), 
+            breaks = c(0, 100, 200, 300, 500, 1000, 2000, 4000, 6000, 8000, Inf), 
+            title = "Radiance (nW cm⁻² sr⁻¹)", 
+            legend.show = TRUE) +
+  tm_layout(main.title = "Houston Metro Area After 2017 Winter Storm",  
+            main.title.size = 1.5,  
+            main.title.position = c("center", "top"),  
+            legend.outside = TRUE,  
+            legend.outside.position = "right",
+            attr.outside = TRUE) +
+  tm_compass(position = c("RIGHT", "top")) +
+  tm_scale_bar(position = c("LEFT", "top"))
+```
+
+### Map of Areas in Houston that Experienced Power Outage
+```{r}
+tm_shape(houston_night_lights_diff) +
+  tm_polygons(col = "black",
+              border.col = "black") +
+  tm_layout(main.title = "Houston Metro Areas Experiencing Blackout",  
+            main.title.size = 1.5,  
+            main.title.position = c("center", "top"),  
+            legend.outside = TRUE,  
+            legend.outside.position = "right",
+            bg.color = "grey") +
+  tm_compass(position = c("RIGHT", "bottom")) +
+  tm_scale_bar(position = c("LEFT", "bottom")) +
+  tm_add_legend(labels = "2017 Blackout Areas",
+                col = "black")
+```
+
+### 4. Exclude highways from the cropped blackout mask
+
+Since highways can have changes in light intensity unrelated to the winter storm, we need to exclude all areas within 200 meters of all highways in the Houston Metro area.
+```{r}
+# change the crs of roads to match the night lights data
+roads <- st_transform(roads, crs = st_crs(houston_night_lights_diff))
+# check the units of roads
+st_crs(roads)$units
+# identify areas within 200m of highways
+roads_buffer <- st_buffer(roads, dist = 200) 
+
+# Combine the buffered highways into a single object
+roads_buffer_union <- st_union(roads_buffer)
+```
+
+```{r}
+# Remove the highways from the night lights object
+blackout <- st_difference(houston_night_lights_diff, roads_buffer_union)
+```
+
+### 5. Identify homes likely impacted by blackout
+
+Identify homes that overlap with areas that experienced blackout.
+```{r}
+# Transform the CRS of the houses spatial object
+houses <- st_transform(houses, crs = st_crs(houston_night_lights_diff))
+# Homes affected by blackout
+blackout_homes <- houses[blackout, ]
+```
+
+### Homes in Houston that Lost Power
+```{r}
+# Map of Houston area homes that lost power
+tm_shape(roads) +
+  tm_lines(col = "darkgrey",
+           legend.col.show = TRUE) +
+  tm_shape(blackout_homes) +
+  tm_polygons(border.col = "#B87D4B")+
+  tm_layout(main.title = "Houston Metro Area Homes that Lost Power",  
+            main.title.size = 1.5,  
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,  
+            legend.outside.position = "right") +
+  tm_compass(position = c("RIGHT", "bottom")) +
+  tm_scale_bar(position = c("LEFT", "bottom")) +
+  tm_add_legend(labels = "Homes that Lost Power",
+                col = "#B87D4B") +
+  tm_add_legend(labels = "Roads",
+                col = "darkgrey")
+```
+
+### Estimate of Houston Area Homes that Lost Power
+```{r}
+# Estimated number of homes that lost power
+number_homes <- nrow(blackout_homes)
+
+tribble(
+  ~Description , ~Total,
+  "Number of Homes", number_homes
+) %>%
+  kable()
+```
+
+### 6. Identify the Census Tracts Likely Impacted by Blackout
+
+Identify census tracts that overlap with homes that experienced blackout.
+```{r}
+# Transform the CRS of the income_geo spatial object
+income_geo <- st_transform(income_geo, crs = st_crs(houston_night_lights_diff))
+# Census tracts affected by blackout
+affected_census_tracts <- income_geo[blackout_homes, ]
+```
+
+### Census Tracts Impacted by Blackout
+```{r}
+# Map of census tracts affected by blackout
+tm_shape(affected_census_tracts) +
+  tm_polygons(col = "#210124",
+              border.col = "grey",
+              lwd = 0.05) +
+  tm_layout(main.title = "Houston Area Census Tracts With Homes that Lost Power",  
+            main.title.size = 1.5,  
+            main.title.position = c("center", "top"),
+            legend.outside = TRUE,  
+            legend.outside.position = "right") +
+  tm_compass(position = c("RIGHT", "bottom")) +
+  tm_scale_bar(position = c("LEFT", "top")) +
+  tm_add_legend(labels = "Census Tracts",
+                col = "#210124",
+                border.col = "grey") 
+```
+
+### Distributions of Median Household Incomes for Census Tracts that Did and Did Not Experience Blackout
+
+Show the distributions of median household incomes for census tracts in which blackouts did and did not occur in order to determine if there is income inequity in where blackouts occurred.
+
+```{r}
+# Census tracts not affected by blackout
+unaffected_census_tracts <- income_geo %>% 
+  filter(!GEOID %in% affected_census_tracts$GEOID)
+```
+
+```{r}
+# Distribution of median household income for census tracts that experienced blackout
+affected <- ggplot(affected_census_tracts, aes(x = B19001e1)) +
+  geom_histogram(fill = "#B3DEC1") +
+  theme_classic() +
+  labs(x = "Affected Census Tracts", y = "Number of Homes")
+
+# Distribution of median household income for census tracts that did not experience blackout
+unaffected <- ggplot(unaffected_census_tracts, aes(x = B19001e1)) +
+  geom_histogram(fill = "#B3DEC1") +
+  theme_classic() +
+  labs(x = "Unaffected Census Tracts", y = "Number of Homes")
+
+affected + unaffected + plot_annotation(
+  title = "Median Household Income of Houston Area Census Tracts"
+)
+```
+
+
+### Reflection
+
+A significant number of homes in the Houston, TX metro area were impacted by blackout during and after the 2017 winter storms. The maps showing where blackouts occurred in the Houston area demonstrate that blackouts were not limited to any one area of the city and its surrounding neighborhoods. In addition, distributions of median household income in both affected and unaffected census tracts, show no clear differences. However, some census tracts are rather large and income inequalities might be more noticeable at a smaller scale. Additional analyzes may look at the racial makeup of census blocks to determine if there are other factors at play when it comes to who may be more suscpetible to blackouts in the future.
+
