@@ -1,3 +1,10 @@
+# Project Specific
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/
+
 # History files
 .Rhistory
 .Rapp.history
